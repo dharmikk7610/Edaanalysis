@@ -11,9 +11,9 @@ import pandas as pd
 import numpy as np
 
 # Import services
-from app.services.data_cleaning import auto_clean_dataset
+from app.services.data_cleaning import auto_clean_dataset, get_column_metrics, apply_column_operation
 from app.services.outliers import detect_outliers, remove_outliers_from_dataset
-from app.services.feature_engineering import apply_scaling, apply_encoding
+from app.services.feature_engineering import apply_scaling, apply_encoding, run_feature_engineering, get_feature_metrics
 from app.services.eda import generate_eda_report
 from app.services.visualizations import generate_plot
 from app.services.insights import generate_ai_insights
@@ -31,7 +31,7 @@ app = FastAPI(title="InsightAI EDA Platform Backend", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # For local dev ease
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -98,6 +98,17 @@ class EncodingRequest(BaseModel):
 class ChatRequest(BaseModel):
     session_id: str
     query: str
+
+class ColumnCleanRequest(BaseModel):
+    session_id: str
+    column: str
+    operation: str
+    params: dict | None = None
+
+class FeatureEngineerRequest(BaseModel):
+    session_id: str
+    operation: str
+    columns: list[str]
 
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -332,6 +343,122 @@ async def reset_dataset(body: dict):
         "column_types": dtypes_map,
         "preview": preview_data,
         "logs": datasets_cache[session_id]["cleaning_log"]
+    }
+
+def get_column_types_map(df: pd.DataFrame) -> dict:
+    dtypes_map = {}
+    for col in df.columns:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            dtypes_map[col] = "Numeric"
+        elif pd.api.types.is_datetime64_any_dtype(df[col]):
+            dtypes_map[col] = "DateTime"
+        else:
+            dtypes_map[col] = "Text"
+    return dtypes_map
+
+@app.post("/api/clean/column")
+async def clean_column_endpoint(req: ColumnCleanRequest):
+    session_id = req.session_id
+    if session_id not in datasets_cache:
+        raise HTTPException(status_code=404, detail="Session expired or not found.")
+        
+    df_before = datasets_cache[session_id]["current"]
+    if req.operation != "rename_column" and req.column not in df_before.columns:
+        raise HTTPException(status_code=400, detail=f"Column '{req.column}' not found.")
+        
+    import time
+    start_time = time.time()
+    try:
+        # Apply operation
+        df_after, affected_rows, modified_values, msg = apply_column_operation(
+            df_before, req.column, req.operation, req.params or {}
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Data cleaning failed: {str(e)}")
+    exec_time = time.time() - start_time
+    
+    # Compute metrics before and after
+    metrics_before = get_column_metrics(df_before, req.column)
+    target_col_after = req.params.get("new_name", req.column) if req.operation == "rename_column" else req.column
+    metrics_after = get_column_metrics(df_after, target_col_after)
+    
+    # Update cache
+    set_session_df(session_id, df_after, msg)
+    log_history_event(session_id, "Column Cleaned", f"Column '{req.column}': {msg}")
+    
+    preview_before = df_before.head(100).replace({np.nan: None}).to_dict(orient="records")
+    preview_after = df_after.head(100).replace({np.nan: None}).to_dict(orient="records")
+    
+    return {
+        "success": True,
+        "msg": msg,
+        "metrics_before": metrics_before,
+        "metrics_after": metrics_after,
+        "affected_rows": affected_rows,
+        "modified_values": modified_values,
+        "execution_time": exec_time,
+        "preview_before": preview_before,
+        "preview_after": preview_after,
+        "columns": list(df_after.columns),
+        "column_types": get_column_types_map(df_after),
+        "rows_count": len(df_after),
+        "cols_count": len(df_after.columns)
+    }
+
+@app.post("/api/feature-engineer")
+async def feature_engineer_endpoint(req: FeatureEngineerRequest):
+    session_id = req.session_id
+    if session_id not in datasets_cache:
+        raise HTTPException(status_code=404, detail="Session expired or not found.")
+        
+    df_before = datasets_cache[session_id]["current"]
+    for col in req.columns:
+        if col not in df_before.columns:
+            raise HTTPException(status_code=400, detail=f"Column '{col}' not found in dataset.")
+            
+    import time
+    start_time = time.time()
+    try:
+        df_after, logs = run_feature_engineering(df_before, req.columns, req.operation)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Feature engineering failed: {str(e)}")
+    exec_time = time.time() - start_time
+    
+    # Compute stats before
+    metrics_before = get_feature_metrics(df_before, req.columns)
+    
+    # For after metrics, map the output columns
+    new_cols = []
+    for col in req.columns:
+        if col in df_after.columns:
+            new_cols.append(col)
+        else:
+            # prefix match (onehot or binary prefix)
+            new_cols.extend([c for c in df_after.columns if c.startswith(f"{col}_")])
+            
+    metrics_after = get_feature_metrics(df_after, new_cols)
+    
+    msg = logs[0] if logs else f"Applied {req.operation} transformation."
+    set_session_df(session_id, df_after, msg)
+    log_history_event(session_id, "Feature Engineering", f"Applied {req.operation} on: {', '.join(req.columns)}")
+    
+    preview_before = df_before.head(100).replace({np.nan: None}).to_dict(orient="records")
+    preview_after = df_after.head(100).replace({np.nan: None}).to_dict(orient="records")
+    
+    return {
+        "success": True,
+        "operation": req.operation,
+        "selected_columns": req.columns,
+        "metrics_before": metrics_before,
+        "metrics_after": metrics_after,
+        "logs": logs,
+        "processing_time": exec_time,
+        "preview_before": preview_before,
+        "preview_after": preview_after,
+        "columns": list(df_after.columns),
+        "column_types": get_column_types_map(df_after),
+        "rows_count": len(df_after),
+        "cols_count": len(df_after.columns)
     }
 
 # ====================================================
